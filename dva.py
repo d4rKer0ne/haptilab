@@ -1,13 +1,12 @@
 # ======================================================================
-# 实时输出：距离 / 速度 / 角度 / 危险等级 / 震动马达
+# 实时输出：距离 / 速度 / 角度（单目标）
 # 使用 Infineon BGT60TR13C + Radar SDK 3.6.x
 # 算法：DopplerAlgo + DigitalBeamForming（DBF）
-# 在树莓派上使用 3 个 GPIO 控制 3 个震动马达
+# 终端文本输出，不再用 matplotlib 画图
 # ======================================================================
 
 import pprint
 import numpy as np
-import RPi.GPIO as GPIO     # 树莓派 GPIO 库
 
 from ifxradarsdk import get_version_full
 from ifxradarsdk.fmcw import DeviceFmcw
@@ -19,150 +18,6 @@ from helpers.DopplerAlgo import DopplerAlgo
 C0 = 3e8  # 光速
 
 
-# ========================= GPIO & 马达相关配置 =========================
-
-# 使用 BCM 编号，根据你实际接线修改下面 3 个 GPIO
-MOTOR_LEFT_PIN = 26    # 左侧马达
-MOTOR_CENTER_PIN = 27  # 中间马达
-MOTOR_RIGHT_PIN = 22   # 右侧马达
-
-# 角度阈值（单位：度）
-# 例如：[-40, -ANGLE_CENTER] 触发左马达
-#      [-ANGLE_CENTER, +ANGLE_CENTER] 触发中马达
-#      [+ANGLE_CENTER, +40] 触发右马达
-ANGLE_CENTER = 10.0
-
-
-def setup_gpio():
-    """初始化树莓派 GPIO，用于控制 3 个震动马达"""
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-
-    GPIO.setup(MOTOR_LEFT_PIN, GPIO.OUT)
-    GPIO.setup(MOTOR_CENTER_PIN, GPIO.OUT)
-    GPIO.setup(MOTOR_RIGHT_PIN, GPIO.OUT)
-
-    # 初始全部关闭
-    GPIO.output(MOTOR_LEFT_PIN, GPIO.LOW)
-    GPIO.output(MOTOR_CENTER_PIN, GPIO.LOW)
-    GPIO.output(MOTOR_RIGHT_PIN, GPIO.LOW)
-
-
-def stop_all_motors():
-    """关闭所有震动马达"""
-    GPIO.output(MOTOR_LEFT_PIN, GPIO.LOW)
-    GPIO.output(MOTOR_CENTER_PIN, GPIO.LOW)
-    GPIO.output(MOTOR_RIGHT_PIN, GPIO.LOW)
-
-
-def activate_motor_by_angle(angle_deg, danger_level):
-    """
-    根据角度和危险等级决定哪个马达震动。
-    - angle_deg: 当前目标角度
-    - danger_level: 危险等级（0~3）
-    这里的策略：
-    - danger_level == 0 时不震动任何马达
-    - danger_level >= 1 时，按照角度选择一个马达震动
-    """
-    # 危险等级 0：认为安全 → 不震动
-    if danger_level <= 0:
-        stop_all_motors()
-        return "None"
-
-    # 根据角度选择马达
-    if angle_deg <= -ANGLE_CENTER:
-        # 左边
-        GPIO.output(MOTOR_LEFT_PIN, GPIO.HIGH)
-        GPIO.output(MOTOR_CENTER_PIN, GPIO.LOW)
-        GPIO.output(MOTOR_RIGHT_PIN, GPIO.LOW)
-        return "LEFT"
-    elif angle_deg >= ANGLE_CENTER:
-        # 右边
-        GPIO.output(MOTOR_LEFT_PIN, GPIO.LOW)
-        GPIO.output(MOTOR_CENTER_PIN, GPIO.LOW)
-        GPIO.output(MOTOR_RIGHT_PIN, GPIO.HIGH)
-        return "RIGHT"
-    else:
-        # 中间
-        GPIO.output(MOTOR_LEFT_PIN, GPIO.LOW)
-        GPIO.output(MOTOR_CENTER_PIN, GPIO.HIGH)
-        GPIO.output(MOTOR_RIGHT_PIN, GPIO.LOW)
-        return "CENTER"
-
-
-# ========================= 危险等级算法 =========================
-
-def compute_danger_level(distance_m, v_rel_m_s):
-    """
-    基于距离 + 相对速度计算危险等级。
-
-    约定：
-    - v_rel_m_s > 0：目标在远离
-    - v_rel_m_s < 0：目标在逼近（closing）
-
-    返回:
-        level: 0, 1, 2, 3
-        label: "SAFE" / "CAUTION" / "WARNING" / "CRITICAL"
-    """
-
-    # 你前面说过：传感器设计目标是 0~6 m / 0~6 m/s
-    # 为了安全起见，这里把超过 6 m 的当作“算法不负责的区域”，只给 0 级
-    RANGE_MAX_USED = 6.0
-
-    if distance_m <= 0 or distance_m > RANGE_MAX_USED:
-        return 0, "SAFE"
-
-    # 逼近速度（closing speed）
-    v_close_raw = max(0.0, -v_rel_m_s)  # v_rel<0 表示逼近
-
-    # 如果你的系统物理上限是 6 m/s，这里做一个饱和处理，保守估计
-    if v_close_raw >= 5.5:
-        v_close = 6.0
-    else:
-        v_close = v_close_raw
-
-    # 阈值（可以按需要自己改）
-    d_crit = 1.0   # m，极近距离
-    d_warn = 3.0   # m，中距离
-    d_caut = 5.0   # m，稍远
-
-    v_slow = 0.5   # m/s，轻微逼近
-    v_fast = 2.0   # m/s，明显逼近
-
-    # ---- 1. 极近距离优先判断 ----
-    if distance_m <= d_crit:
-        if v_close > 0.5:
-            return 3, "CRITICAL"   # 很近 + 还在逼近
-        else:
-            return 2, "WARNING"    # 很近但相对速度小
-
-    # ---- 2. 中近距离 (<= d_warn) ----
-    if distance_m <= d_warn:
-        if v_close >= v_fast:
-            return 3, "CRITICAL"   # 中距离但逼近很快
-        elif v_close >= v_slow:
-            return 2, "WARNING"    # 中距离且有明显逼近
-        else:
-            return 1, "CAUTION"    # 中距离但速度不大，提示注意
-
-    # ---- 3. 远一点 (<= d_caut) ----
-    if distance_m <= d_caut:
-        if v_close >= v_fast:
-            return 2, "WARNING"    # 远一点但逼近快
-        elif v_close >= v_slow:
-            return 1, "CAUTION"    # 远一点且缓慢逼近
-        else:
-            return 0, "SAFE"       # 远且不逼近
-
-    # ---- 4. 5~6 m 区间 ----
-    if v_close >= v_fast:
-        return 1, "CAUTION"
-    else:
-        return 0, "SAFE"
-
-
-# ========================= 雷达天线工具函数 =========================
-
 def num_rx_antennas_from_rx_mask(rx_mask: int) -> int:
     """根据 rx_mask 计算启用的天线数量"""
     c = 0
@@ -172,23 +27,21 @@ def num_rx_antennas_from_rx_mask(rx_mask: int) -> int:
     return c
 
 
-# ========================= 主程序 =========================
-
 def main():
     # ---------------- 雷达配置（与原 DBF demo 一样） ----------------
     num_beams = 27          # 波束数
     max_angle_degrees = 40  # 角度范围：[-40, 40] 度
 
     config = FmcwSimpleSequenceConfig(
-        frame_repetition_time_s=0.5,      # 帧周期 0.15s（约 6.7 Hz）
-        chirp_repetition_time_s=0.00025,    # Chirp 周期 0.5 ms
-        num_chirps=64,                    # 每帧 chirp 数
+        frame_repetition_time_s=0.15,      # 帧周期 0.15s（约 6.7 Hz）
+        chirp_repetition_time_s=0.0005,    # Chirp 周期 0.5 ms
+        num_chirps=128,                    # 每帧 chirp 数
         tdm_mimo=False,                    # 关闭 MIMO
         chirp=FmcwSequenceChirp(
             start_frequency_Hz=60e9,       # 起始频率 60 GHz
             end_frequency_Hz=61.5e9,       # 终止频率 61.5 GHz
             sample_rate_Hz=1e6,            # ADC 采样率 1 MHz
-            num_samples=128,                # 每个 chirp 64 点
+            num_samples=64,                # 每个 chirp 64 点
             rx_mask=5,                     # 启用 RX1 和 RX3
             tx_mask=1,                     # 启用 TX1
             tx_power_level=31,             # 发射功率
@@ -197,9 +50,6 @@ def main():
             if_gain_dB=33,                 # IF 增益 33 dB
         ),
     )
-
-    # 初始化 GPIO
-    setup_gpio()
 
     # ---------------- 打开设备 & 配置采集 ----------------
     with DeviceFmcw() as device:
@@ -268,7 +118,6 @@ def main():
             frame_contents = device.get_next_frame()
             if not frame_contents:
                 print("Warning: empty frame received")
-                stop_all_motors()
                 continue
 
             frame = frame_contents[0]
@@ -312,7 +161,6 @@ def main():
             max_energy = np.max(beam_range_energy)
             if max_energy <= 0:
                 print("No significant target detected.")
-                stop_all_motors()
                 continue
 
             range_idx, beam_idx = np.unravel_index(
@@ -330,24 +178,14 @@ def main():
             doppler_idx = int(np.argmax(doppler_power))
             doppler_center = doppler_len // 2  # 认为 0 速度在中间
 
-            # 这里 speed_m_s 就是我们之前定义的 v_rel：
-            # v_rel > 0: 远离, v_rel < 0: 逼近
             rel_idx = doppler_idx - doppler_center
             speed_m_s = -rel_idx * speed_res_m_s  # 加负号以匹配你之前方向定义
 
-            # ---- 6) 计算危险等级 ----
-            danger_level, danger_label = compute_danger_level(distance_m, speed_m_s)
-
-            # ---- 7) 根据角度 + 危险等级控制马达 ----
-            motor_name = activate_motor_by_angle(angle_deg, danger_level)
-
-            # ---- 8) 在终端输出结果 ----
+            # ---- 6) 在终端输出结果 ----
             print(
                 f"R = {distance_m:5.3f} m, "
                 f"V = {speed_m_s:6.3f} m/s, "
-                f"A = {angle_deg:6.2f} deg, "
-                f"DANGER = {danger_level}({danger_label}), "
-                f"MOTOR = {motor_name}"
+                f"A = {angle_deg:6.2f} deg"
             )
 
 
@@ -356,10 +194,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nStopped by user.")
-    finally:
-        # 安全退出时关掉所有马达，并释放 GPIO
-        try:
-            stop_all_motors()
-        except Exception:
-            pass
-        GPIO.cleanup()
